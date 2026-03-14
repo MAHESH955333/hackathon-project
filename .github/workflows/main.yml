@@ -1,0 +1,112 @@
+name: CloudShield CI-CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'board/**'   # only board folder changes trigger pipeline
+
+jobs:
+  build-deploy:
+    runs-on: self-hosted
+
+    steps:
+
+    # 1 Checkout code
+    - name: Checkout Code
+      uses: actions/checkout@v3
+
+    # 2 Setup Java
+    - name: Setup Java
+      uses: actions/setup-java@v3
+      with:
+        distribution: temurin
+        java-version: 17
+
+    # 3 Build Application
+    - name: Build Application
+      run: |
+        cd board
+        mvn clean package
+
+    # 4 SonarQube Analysis
+    - name: SonarQube Scan
+      run: |
+        cd board
+        mvn sonar:sonar \
+        -Dsonar.host.url=${{ secrets.SONAR_HOST_URL }} \
+        -Dsonar.login=${{ secrets.SONAR_TOKEN }}
+
+    # 5 Build Docker Image
+    - name: Build Docker Image
+      run: |
+        docker build -t cloudshield-app ./board
+
+    # 6 Trivy Scan
+    - name: Trivy Scan
+      run: |
+        trivy image cloudshield-app
+
+    # 7 Configure AWS Credentials
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ap-south-1
+
+    # 8 Login to ECR
+    - name: Login to ECR
+      run: |
+        aws ecr get-login-password --region ap-south-1 \
+        | docker login --username AWS --password-stdin ${{ secrets.ECR_REPO }}
+
+    # 9 Tag Docker Image
+    - name: Tag Docker Image
+      run: |
+        docker tag cloudshield-app:latest \
+        ${{ secrets.ECR_REPO }}/hackathon-repo:latest
+
+    # 10 Push Docker Image
+    - name: Push Docker Image
+      run: |
+        docker push ${{ secrets.ECR_REPO }}/hackathon-repo:latest
+
+    # 11 Install eksctl
+    - name: Install eksctl
+      run: |
+        curl --silent --location "https://github.com/weaveworks/eksctl/releases/latest/download/eksctl_$(uname -s)_amd64.tar.gz" | tar xz -C /tmp
+        sudo mv /tmp/eksctl /usr/local/bin
+
+    # 12 Create EKS Cluster
+    - name: Create EKS Cluster
+      run: |
+        eksctl create cluster \
+        --name cloudshield-cluster \
+        --region ap-south-1 \
+        --nodegroup-name standard-workers \
+        --node-type t3.medium \
+        --nodes 2 \
+        --nodes-min 1 \
+        --nodes-max 3 \
+        --managed || echo "Cluster already exists"
+
+    # 13 Update kubeconfig
+    - name: Configure kubectl
+      run: |
+        aws eks update-kubeconfig \
+        --region ap-south-1 \
+        --name cloudshield-cluster
+
+    # 14 Deploy to EKS
+    - name: Deploy Application
+      run: |
+        kubectl apply -f deployment.yaml
+        kubectl apply -f service.yaml
+
+    # 15 Update Image
+    - name: Update Deployment Image
+      run: |
+        kubectl set image deployment/demo-app \
+        demo-app=${{ secrets.ECR_REPO }}/hackathon-repo:latest --record
